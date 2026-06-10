@@ -1,3 +1,1 @@
-# Electrical
-
-Schematics, PCB sources, and exports for the mechatronics project.
+# Electrical (empty)
