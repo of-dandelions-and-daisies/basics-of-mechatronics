@@ -1,3 +1,1 @@
-# Firmware MCU1
-
-First microcontroller firmware for the mechatronics project.
+# MCU1 (empty)
