@@ -1,0 +1,423 @@
+/*
+====================================================
+SLAVE FINAL V2
+====================================================
+Functions:
+- Lift Mechanism
+- PID Shooter
+- Sorting Mechanism
+- I2C Slave Communication
+
+I2C Address = 8
+
+Commands:
+1 = START_LIFT
+2 = CLEAR_RESULT
+
+Results:
+0  = NONE
+12 = YELLOW
+13 = PINK
+====================================================
+*/
+
+#include <Wire.h>
+#include <Servo.h>
+
+// =================================================
+// I2C
+// =================================================
+
+#define SLAVE_ADDRESS 8
+
+#define CMD_START_LIFT   1
+#define CMD_CLEAR_RESULT 2
+
+#define RESULT_NONE      0
+#define RESULT_YELLOW    12
+#define RESULT_PINK      13
+
+volatile byte receivedCommand = 0;
+volatile byte colorResult = RESULT_NONE;
+
+// =================================================
+// LIFT
+// =================================================
+
+Servo liftServo;
+
+#define LIFT_SERVO_PIN 2
+
+#define LIFT_FORWARD 0
+#define LIFT_STOP    90
+
+bool liftRequested = false;
+
+// =================================================
+// SORTER
+// =================================================
+
+Servo sorterServo;
+
+#define SORT_SERVO_PIN     5
+
+#define SORT_LOW_SENSOR    11
+#define SORT_HIGH_SENSOR   12
+
+#define SORT_YELLOW_POS    0
+#define SORT_PINK_POS      55
+
+// =================================================
+// SHOOTER (Original PID System)
+// =================================================
+
+#define ENCODER_PIN 10
+#define IN1         3
+#define IN2         4
+#define PWM_PIN     9
+#define IR_PIN      6
+
+const long PULLBACK_PULSES = 5;
+const long SHOOT_PULSES    = 24;
+
+const int PULLBACK_SPEED   = 80;
+const int SHOOT_SPEED      = 255;
+
+float Kp = 9.0;
+float Kd = 1.5;
+float Ki = 0.0;
+
+const int INERTIA_COMP_FORWARD  = 2;
+const int INERTIA_COMP_BACKWARD = 1;
+
+const int MIN_SPEED = 80;
+const int MAX_SPEED = 150;
+
+long pulseCount = 0;
+bool lastEncoderState = HIGH;
+unsigned long lastPulseTime = 0;
+
+const unsigned long DEBOUNCE_US = 1500;
+
+bool systemBusy = false;
+
+// =================================================
+// ENCODER
+// =================================================
+
+void readEncoder()
+{
+  bool currentState = digitalRead(ENCODER_PIN);
+
+  unsigned long now = micros();
+
+  if(lastEncoderState == HIGH && currentState == LOW)
+  {
+    if(now - lastPulseTime > DEBOUNCE_US)
+    {
+      pulseCount++;
+      lastPulseTime = now;
+    }
+  }
+
+  lastEncoderState = currentState;
+}
+
+// =================================================
+// MOTOR CONTROL
+// =================================================
+
+void motorForward(int spd)
+{
+  spd = constrain(spd, MIN_SPEED, MAX_SPEED);
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  analogWrite(PWM_PIN, spd);
+}
+
+void motorBackward(int spd)
+{
+  spd = constrain(spd, MIN_SPEED, MAX_SPEED);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  analogWrite(PWM_PIN, spd);
+}
+
+void motorBrake()
+{
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, HIGH);
+
+  analogWrite(PWM_PIN, 255);
+}
+
+void motorStop()
+{
+  analogWrite(PWM_PIN, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+}
+
+// =================================================
+// PID MOVE
+// =================================================
+
+void pidMove(long targetPulses,
+             bool isBackward,
+             int maxSpeed,
+             int inertiaCompensation)
+{
+  long effectiveTarget = targetPulses - inertiaCompensation;
+
+  if(effectiveTarget <= 0)
+    effectiveTarget = targetPulses;
+
+  pulseCount = 0;
+
+  lastEncoderState = digitalRead(ENCODER_PIN);
+
+  lastPulseTime = micros();
+
+  float lastError = effectiveTarget;
+
+  unsigned long startTime = millis();
+  unsigned long lastTime = millis();
+
+  const unsigned long TIMEOUT = 3000;
+
+  while(true)
+  {
+    readEncoder();
+
+    long currentPulses = pulseCount;
+
+    float error = effectiveTarget - currentPulses;
+
+    if(error <= 0)
+    {
+      motorBrake();
+      break;
+    }
+
+    if(millis() - startTime > TIMEOUT)
+    {
+      motorBrake();
+      break;
+    }
+
+    unsigned long now = millis();
+
+    float dt = (now - lastTime) / 1000.0;
+
+    if(dt <= 0)
+      dt = 0.001;
+
+    lastTime = now;
+
+    float derivative = (error - lastError) / dt;
+
+    lastError = error;
+
+    float output = (Kp * error) + (Kd * derivative);
+
+    int speed = constrain((int)output,
+                          MIN_SPEED,
+                          maxSpeed);
+
+    if(isBackward)
+      motorBackward(speed);
+    else
+      motorForward(speed);
+  }
+
+  delay(250);
+
+  motorStop();
+}
+
+// =================================================
+// SHOOT
+// =================================================
+
+void fireSequence()
+{
+  systemBusy = true;
+
+  pidMove(
+    PULLBACK_PULSES,
+    true,
+    PULLBACK_SPEED,
+    INERTIA_COMP_BACKWARD
+  );
+
+  delay(400);
+
+  pidMove(
+    SHOOT_PULSES,
+    false,
+    SHOOT_SPEED,
+    INERTIA_COMP_FORWARD
+  );
+
+  systemBusy = false;
+}
+
+// =================================================
+// LIFT
+// =================================================
+
+void runLift()
+{
+  liftServo.write(LIFT_FORWARD);
+
+  delay(6000);
+
+  liftServo.write(LIFT_STOP);
+}
+
+// =================================================
+// SORTING
+// =================================================
+
+void waitForAndSortBall()
+{
+  unsigned long start = millis();
+
+  while(millis() - start < 5000)
+  {
+    int low  = digitalRead(SORT_LOW_SENSOR);
+    int high = digitalRead(SORT_HIGH_SENSOR);
+
+    // Yellow
+    if(low == LOW && high == HIGH)
+    {
+      sorterServo.write(SORT_YELLOW_POS);
+
+      colorResult = RESULT_YELLOW;
+
+      delay(500);
+
+      return;
+    }
+
+    // Pink
+    if(high == LOW)
+    {
+      sorterServo.write(SORT_PINK_POS);
+
+      colorResult = RESULT_PINK;
+
+      delay(500);
+
+      return;
+    }
+  }
+
+  colorResult = RESULT_NONE;
+}
+
+// =================================================
+// I2C RECEIVE
+// =================================================
+
+void receiveEvent(int howMany)
+{
+  while(Wire.available())
+  {
+    receivedCommand = Wire.read();
+
+    if(receivedCommand == CMD_START_LIFT)
+    {
+      liftRequested = true;
+    }
+
+    if(receivedCommand == CMD_CLEAR_RESULT)
+    {
+      colorResult = RESULT_NONE;
+    }
+  }
+}
+
+// =================================================
+// I2C REQUEST
+// =================================================
+
+void requestEvent()
+{
+  Wire.write(colorResult);
+}
+
+// =================================================
+// SETUP
+// =================================================
+
+void setup()
+{
+  Wire.begin(SLAVE_ADDRESS);
+
+  Wire.onReceive(receiveEvent);
+  Wire.onRequest(requestEvent);
+
+  liftServo.attach(LIFT_SERVO_PIN);
+  sorterServo.attach(SORT_SERVO_PIN);
+
+  liftServo.write(LIFT_STOP);
+  sorterServo.write(SORT_YELLOW_POS);
+
+  pinMode(SORT_LOW_SENSOR, INPUT);
+  pinMode(SORT_HIGH_SENSOR, INPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(PWM_PIN, OUTPUT);
+
+  motorStop();
+
+  pinMode(ENCODER_PIN, INPUT_PULLUP);
+
+  lastEncoderState = digitalRead(ENCODER_PIN);
+
+  pinMode(IR_PIN, INPUT_PULLUP);
+
+  Serial.begin(115200);
+}
+
+// =================================================
+// LOOP
+// =================================================
+
+void loop()
+{
+  if(liftRequested)
+  {
+    liftRequested = false;
+
+    colorResult = RESULT_NONE;
+
+    runLift();
+
+    unsigned long waitStart = millis();
+
+    while(millis() - waitStart < 10000)
+    {
+      if(digitalRead(IR_PIN) == LOW)
+      {
+        delay(50);
+
+        if(digitalRead(IR_PIN) == LOW)
+        {
+          fireSequence();
+
+          waitForAndSortBall();
+
+          break;
+        }
+      }
+    }
+  }
+}
