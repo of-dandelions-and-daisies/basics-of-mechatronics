@@ -1,0 +1,573 @@
+/*
+=========================================================
+MASTER FINAL V2
+=========================================================
+
+MASTER NANO RESPONSIBILITIES
+----------------------------
+- HC06 Bluetooth Communication
+- LCD Display
+- Buzzer Startup Tune
+- Dispenser Sensor
+- Dispenser Servo
+- Box Sensor
+- Yellow Button
+- Pink Button
+- Score System
+- I2C Master Communication
+- GUI Messaging
+
+I2C COMMANDS
+------------
+1 = START_LIFT
+2 = CLEAR_RESULT
+
+SLAVE RETURNS
+-------------
+0  = NONE
+12 = YELLOW
+13 = PINK
+
+BLUETOOTH COMMANDS
+------------------
+START
+STOP
+DISPENSE
+SYS:MODE:AUTO
+SYS:MODE:MANUAL
+
+GUI MESSAGES
+------------
+STATUS:READY
+STATUS:RUNNING
+STATUS:IDLE
+
+BALL:YELLOW
+BALL:PINK
+
+GAME:CORRECT
+GAME:WRONG
+
+SCORE:x
+
+DISP:LOCKED
+DISP:OFF
+DISP:ON
+
+NO BALL
+
+=========================================================
+*/
+
+#include <Wire.h>
+#include <Servo.h>
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+
+// =====================================================
+// LCD
+// =====================================================
+
+LiquidCrystal_I2C lcd(0x27,16,2);
+
+// =====================================================
+// BLUETOOTH
+// =====================================================
+
+SoftwareSerial bluetooth(2,3); // RX,TX
+
+// =====================================================
+// I2C
+// =====================================================
+
+#define SLAVE_ADDRESS      8
+
+#define CMD_START_LIFT     1
+#define CMD_CLEAR_RESULT   2
+
+#define RESULT_NONE        0
+#define RESULT_YELLOW      12
+#define RESULT_PINK        13
+
+// =====================================================
+// PINS
+// =====================================================
+
+#define DISPENSER_SENSOR   4
+#define DISPENSER_SERVO    5
+
+#define BOX_SENSOR         6
+
+#define BUZZER_PIN         7
+
+#define YELLOW_BUTTON      8
+#define PINK_BUTTON        9
+
+// =====================================================
+// SERVO
+// =====================================================
+
+Servo dispenserServo;
+
+#define DISPENSER_CLOSED   70
+#define DISPENSER_OPEN     10
+
+// =====================================================
+// SYSTEM FLAGS
+// =====================================================
+
+bool systemRunning = false;
+
+bool autoMode = false;
+
+bool gameActive = false;
+
+bool waitingForAnswer = false;
+
+bool answerReceived = false;
+
+bool childAnswerPink = false;
+
+bool resultProcessed = false;
+
+// =====================================================
+// SCORE
+// =====================================================
+
+int score = 0;
+
+// =====================================================
+// BLUETOOTH BUFFER
+// =====================================================
+
+String inputBuffer = "";
+
+// =====================================================
+// STARTUP TUNE
+// =====================================================
+
+void playStartupTune()
+{
+  tone(BUZZER_PIN,523,150);
+  delay(180);
+
+  tone(BUZZER_PIN,659,150);
+  delay(180);
+
+  tone(BUZZER_PIN,784,150);
+  delay(180);
+
+  noTone(BUZZER_PIN);
+}
+
+// =====================================================
+// LCD
+// =====================================================
+
+void welcomeScreen()
+{
+  lcd.clear();
+
+  lcd.setCursor(0,0);
+  lcd.print("SpongeBob Toy");
+
+  lcd.setCursor(0,1);
+  lcd.print("Ready To Play!");
+}
+
+// =====================================================
+// BLUETOOTH SEND
+// =====================================================
+
+void btSend(String msg)
+{
+  bluetooth.println(msg);
+  Serial.println(msg);
+}
+
+// =====================================================
+// DISPENSER
+// =====================================================
+
+void dispenseBall()
+{
+  btSend("DISP:ON");
+
+  dispenserServo.write(DISPENSER_OPEN);
+
+  delay(350);
+
+  dispenserServo.write(DISPENSER_CLOSED);
+
+  btSend("DISP:OFF");
+}
+
+// =====================================================
+// I2C
+// =====================================================
+
+void sendLiftCommand()
+{
+  Wire.beginTransmission(SLAVE_ADDRESS);
+
+  Wire.write(CMD_START_LIFT);
+
+  Wire.endTransmission();
+}
+
+void clearSlaveResult()
+{
+  Wire.beginTransmission(SLAVE_ADDRESS);
+
+  Wire.write(CMD_CLEAR_RESULT);
+
+  Wire.endTransmission();
+}
+
+byte getSlaveResult()
+{
+  Wire.requestFrom(SLAVE_ADDRESS,1);
+
+  if(Wire.available())
+  {
+    return Wire.read();
+  }
+
+  return RESULT_NONE;
+}
+
+// =====================================================
+// QUESTION SCREEN
+// =====================================================
+
+void showQuestion()
+{
+  lcd.clear();
+
+  lcd.setCursor(0,0);
+  lcd.print("What Color?");
+
+  lcd.setCursor(0,1);
+  lcd.print("Pink/Yellow");
+}
+
+// =====================================================
+// ANSWER
+// =====================================================
+
+void checkButtons()
+{
+  if(!waitingForAnswer)
+    return;
+
+  if(digitalRead(PINK_BUTTON)==LOW)
+  {
+    delay(30);
+
+    if(digitalRead(PINK_BUTTON)==LOW)
+    {
+      childAnswerPink = true;
+
+      answerReceived = true;
+
+      waitingForAnswer = false;
+
+      lcd.clear();
+
+      lcd.print("Pink Chosen");
+
+      delay(1000);
+
+      sendLiftCommand();
+    }
+  }
+
+  if(digitalRead(YELLOW_BUTTON)==LOW)
+  {
+    delay(30);
+
+    if(digitalRead(YELLOW_BUTTON)==LOW)
+    {
+      childAnswerPink = false;
+
+      answerReceived = true;
+
+      waitingForAnswer = false;
+
+      lcd.clear();
+
+      lcd.print("Yellow Chosen");
+
+      delay(1000);
+
+      sendLiftCommand();
+    }
+  }
+}
+
+// =====================================================
+// RESULT PROCESSING
+// =====================================================
+
+void processResult(byte result)
+{
+  if(result == RESULT_NONE)
+    return;
+
+  bool actualPink = false;
+
+  if(result == RESULT_PINK)
+  {
+    actualPink = true;
+
+    btSend("BALL:PINK");
+  }
+
+  if(result == RESULT_YELLOW)
+  {
+    actualPink = false;
+
+    btSend("BALL:YELLOW");
+  }
+
+  lcd.clear();
+
+  if(actualPink == childAnswerPink)
+  {
+    score++;
+
+    btSend("GAME:CORRECT");
+
+    lcd.setCursor(0,0);
+    lcd.print("Correct!");
+
+    lcd.setCursor(0,1);
+    lcd.print("Good Job :)");
+  }
+  else
+  {
+    btSend("GAME:WRONG");
+
+    lcd.setCursor(0,0);
+    lcd.print("Oops!");
+
+    lcd.setCursor(0,1);
+    lcd.print("Wrong Answer");
+  }
+
+  btSend("SCORE:" + String(score));
+
+  delay(3000);
+
+  clearSlaveResult();
+
+  answerReceived = false;
+
+  gameActive = false;
+
+  resultProcessed = false;
+
+  welcomeScreen();
+}
+
+// =====================================================
+// GAME FLOW
+// =====================================================
+
+void handleBoxSensor()
+{
+  if(!systemRunning)
+    return;
+
+  if(gameActive)
+    return;
+
+  if(digitalRead(BOX_SENSOR)==LOW)
+  {
+    gameActive = true;
+
+    waitingForAnswer = true;
+
+    showQuestion();
+  }
+}
+
+void checkSlaveResult()
+{
+  if(!answerReceived)
+    return;
+
+  byte result = getSlaveResult();
+
+  if(result != RESULT_NONE)
+  {
+    processResult(result);
+  }
+}
+
+// =====================================================
+// COMMANDS
+// =====================================================
+
+void startSystem()
+{
+  systemRunning = true;
+
+  btSend("STATUS:RUNNING");
+
+  lcd.clear();
+
+  lcd.print("System Running");
+}
+
+void stopSystem()
+{
+  systemRunning = false;
+
+  gameActive = false;
+
+  waitingForAnswer = false;
+
+  answerReceived = false;
+
+  btSend("STATUS:IDLE");
+
+  lcd.clear();
+
+  lcd.print("System Idle");
+}
+
+void handleCommand(String cmd)
+{
+  if(cmd=="START")
+  {
+    startSystem();
+  }
+
+  else if(cmd=="STOP")
+  {
+    stopSystem();
+  }
+
+  else if(cmd=="SYS:MODE:AUTO")
+  {
+    autoMode = true;
+
+    btSend("SYS:MODE:AUTO:OK");
+  }
+
+  else if(cmd=="SYS:MODE:MANUAL")
+  {
+    autoMode = false;
+
+    btSend("SYS:MODE:MANUAL:OK");
+  }
+
+  else if(cmd=="DISPENSE")
+  {
+    if(!systemRunning)
+      return;
+
+    if(gameActive)
+      return;
+
+    if(digitalRead(DISPENSER_SENSOR)==LOW)
+    {
+      dispenseBall();
+    }
+    else
+    {
+      btSend("NO BALL");
+    }
+  }
+}
+
+// =====================================================
+// BLUETOOTH READ
+// =====================================================
+
+void readBluetooth()
+{
+  while(bluetooth.available())
+  {
+    char c = bluetooth.read();
+
+    if(c=='\n')
+    {
+      inputBuffer.trim();
+
+      if(inputBuffer.length()>0)
+      {
+        handleCommand(inputBuffer);
+      }
+
+      inputBuffer="";
+    }
+    else
+    {
+      inputBuffer += c;
+    }
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(9600);
+
+  bluetooth.begin(9600);
+
+  Wire.begin();
+
+  pinMode(DISPENSER_SENSOR,INPUT);
+
+  pinMode(BOX_SENSOR,INPUT);
+
+  pinMode(PINK_BUTTON,INPUT_PULLUP);
+
+  pinMode(YELLOW_BUTTON,INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN,OUTPUT);
+
+  dispenserServo.attach(DISPENSER_SERVO);
+
+  dispenserServo.write(DISPENSER_CLOSED);
+
+  lcd.init();
+
+  lcd.backlight();
+
+  playStartupTune();
+
+  welcomeScreen();
+
+  btSend("STATUS:READY");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  readBluetooth();
+
+  if(autoMode &&
+     systemRunning &&
+     !gameActive &&
+     digitalRead(DISPENSER_SENSOR)==LOW)
+  {
+    dispenseBall();
+
+    delay(500);
+  }
+
+  handleBoxSensor();
+
+  checkButtons();
+
+  checkSlaveResult();
+}
